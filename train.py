@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+from datasets import load_dataset as hf_load_dataset
 
 from model import DriftDiT_Tiny, DriftDiT_Small, DriftDiT_models
 from drifting import (
@@ -79,8 +80,49 @@ CIFAR10_CONFIG = {
     "label_dropout": 0.1,
 }
 
+TURCOINS_CONFIG = {
+    "model": "DriftDiT-Small",
+    "img_size": 32,
+    "in_channels": 3,
+    "num_classes": 138,
+    "batch_nc": 10,
+    "batch_n_pos": 32,
+    "batch_n_neg": 32,
+    "temperatures": [0.02, 0.05, 0.2],
+    "lr": 2e-4,
+    "weight_decay": 0.01,
+    "grad_clip": 2.0,
+    "ema_decay": 0.999,
+    "warmup_steps": 2000,
+    "epochs": 200,
+    "alpha_min": 1.0,
+    "alpha_max": 3.0,
+    "use_feature_encoder": True,
+    "queue_size": 128,
+    "label_dropout": 0.1,
+}
 
-def get_dataset(name: str, root: str = "/home/qingtianzhu.ty/drifting/data") -> tuple:
+
+class HFImageDataset(torch.utils.data.Dataset):
+    """Adapter to wrap a HuggingFace imagefolder dataset as a PyTorch dataset."""
+
+    def __init__(self, hf_dataset, transform=None):
+        self.hf_dataset = hf_dataset
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.hf_dataset)
+
+    def __getitem__(self, idx):
+        item = self.hf_dataset[idx]
+        image = item["image"].convert("RGB")
+        label = item["label"]
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+
+
+def get_dataset(name: str, root: str = "./data") -> tuple:
     """Get dataset and transforms."""
     if name.lower() == "mnist":
         # MNIST data is at {root}/mnist/MNIST/raw/
@@ -90,8 +132,8 @@ def get_dataset(name: str, root: str = "/home/qingtianzhu.ty/drifting/data") -> 
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),  # [-1, 1]
         ])
-        train_dataset = datasets.MNIST(mnist_root, train=True, download=False, transform=transform)
-        test_dataset = datasets.MNIST(mnist_root, train=False, download=False, transform=transform)
+        train_dataset = datasets.MNIST(mnist_root, train=True, download=True, transform=transform)
+        test_dataset = datasets.MNIST(mnist_root, train=False, download=True, transform=transform)
     elif name.lower() in ["cifar10", "cifar"]:
         transform = transforms.Compose([
             transforms.RandomHorizontalFlip(),
@@ -104,6 +146,23 @@ def get_dataset(name: str, root: str = "/home/qingtianzhu.ty/drifting/data") -> 
         ])
         train_dataset = datasets.CIFAR10(root, train=True, download=True, transform=transform)
         test_dataset = datasets.CIFAR10(root, train=False, download=True, transform=test_transform)
+    elif name.lower() == "turcoins":
+        transform = transforms.Compose([
+            transforms.Resize(32),
+            transforms.CenterCrop(32),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+        ])
+        test_transform = transforms.Compose([
+            transforms.Resize(32),
+            transforms.CenterCrop(32),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+        ])
+        hf_ds = hf_load_dataset("hsyntemiz/turcoins")
+        train_dataset = HFImageDataset(hf_ds["train"], transform=transform)
+        test_dataset = HFImageDataset(hf_ds["test"], transform=test_transform)
     else:
         raise ValueError(f"Unknown dataset: {name}")
 
@@ -112,15 +171,15 @@ def get_dataset(name: str, root: str = "/home/qingtianzhu.ty/drifting/data") -> 
 
 def sample_batch(
     queue: SampleQueue,
-    num_classes: int,
+    class_indices: torch.Tensor,
     n_pos: int,
     device: torch.device,
 ) -> tuple:
-    """Sample a batch of positive samples from the queue."""
+    """Sample a batch of positive samples from the queue for given classes."""
     x_pos_list = []
     labels_list = []
 
-    for c in range(num_classes):
+    for c in class_indices.tolist():
         x_c = queue.sample(c, n_pos, device)
         x_pos_list.append(x_c)
         labels_list.append(torch.full((n_pos,), c, device=device, dtype=torch.long))
@@ -159,7 +218,7 @@ def compute_drifting_loss(
         info: Dict with metrics
     """
     device = x_gen.device
-    num_classes = labels_gen.max().item() + 1
+    unique_classes = torch.unique(labels_gen).tolist()
 
     # Extract features
     if use_pixel_space or feature_encoder is None:
@@ -181,7 +240,7 @@ def compute_drifting_loss(
     num_losses = 0
 
     # Compute loss per class
-    for c in range(num_classes):
+    for c in unique_classes:
         mask_gen = labels_gen == c
         mask_pos = labels_pos == c
 
@@ -255,6 +314,7 @@ def train_step(
     """
     model.train()
     num_classes = config["num_classes"]
+    batch_nc = config["batch_nc"]
     n_pos = config["batch_n_pos"]
     n_neg = config["batch_n_neg"]
     alpha_min = config["alpha_min"]
@@ -262,11 +322,14 @@ def train_step(
     temperatures = config["temperatures"]
     use_pixel = not config["use_feature_encoder"]
 
-    # Total batch size
-    batch_size = num_classes * n_neg
+    # Sample batch_nc random classes for this step
+    selected_classes = torch.randperm(num_classes)[:batch_nc]
 
-    # Sample class labels (repeat each class n_neg times)
-    labels = torch.arange(num_classes, device=device).repeat_interleave(n_neg)
+    # Total batch size
+    batch_size = batch_nc * n_neg
+
+    # Sample class labels (repeat each selected class n_neg times)
+    labels = selected_classes.to(device).repeat_interleave(n_neg)
 
     # Sample CFG alpha ~ Uniform(alpha_min, alpha_max)
     alpha = torch.empty(batch_size, device=device).uniform_(alpha_min, alpha_max)
@@ -284,7 +347,7 @@ def train_step(
     x_gen = model(noise, labels, alpha)
 
     # Sample positive samples from queue
-    x_pos, labels_pos = sample_batch(queue, num_classes, n_pos, device)
+    x_pos, labels_pos = sample_batch(queue, selected_classes, n_pos, device)
 
     # Compute drifting loss
     loss, info = compute_drifting_loss(
@@ -341,13 +404,17 @@ def train(
     log_interval: int = 100,
     save_interval: int = 10,
     sample_interval: int = 10,
+    epochs_override: Optional[int] = None,
 ):
     """Main training function."""
     set_seed(seed)
 
     # Get config
-    config = MNIST_CONFIG.copy() if dataset.lower() == "mnist" else CIFAR10_CONFIG.copy()
+    configs = {"mnist": MNIST_CONFIG, "cifar10": CIFAR10_CONFIG, "turcoins": TURCOINS_CONFIG}
+    config = configs[dataset.lower()].copy()
     config["dataset"] = dataset
+    if epochs_override is not None:
+        config["epochs"] = epochs_override
 
     # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -570,9 +637,12 @@ def generate_samples(
     in_channels = config["in_channels"]
     img_size = config["img_size"]
 
+    # Cap visualization to 20 classes max to keep grids manageable
+    vis_classes = min(num_classes, 20)
+
     # Generate samples for each class
     samples = []
-    for c in range(num_classes):
+    for c in range(vis_classes):
         noise = torch.randn(num_per_class, in_channels, img_size, img_size, device=device)
         labels = torch.full((num_per_class,), c, device=device, dtype=torch.long)
         alpha_tensor = torch.full((num_per_class,), alpha, device=device)
@@ -637,6 +707,12 @@ def main():
         default=10,
         help="Sample generation interval (epochs)",
     )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Override total epochs (useful for extending training with --resume)",
+    )
 
     args = parser.parse_args()
 
@@ -649,6 +725,7 @@ def main():
         log_interval=args.log_interval,
         save_interval=args.save_interval,
         sample_interval=args.sample_interval,
+        epochs_override=args.epochs,
     )
 
 

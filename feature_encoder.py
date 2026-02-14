@@ -359,7 +359,7 @@ def create_feature_encoder(
             feature_dim=feature_dim,
             multi_scale=multi_scale,
         )
-    elif dataset.lower() in ["cifar10", "cifar"]:
+    elif dataset.lower() in ["cifar10", "cifar", "turcoins"]:
         if use_pretrained:
             # Use ImageNet-pretrained ResNet - returns multi-scale feature maps
             return PretrainedResNetEncoder(pretrained=True)
