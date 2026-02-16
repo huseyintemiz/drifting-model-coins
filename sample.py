@@ -269,8 +269,13 @@ def sample_and_save(
     elif dataset.lower() == "turcoins":
         model_name = config.get("model", "DriftDiT-Small")
         in_channels = config.get("in_channels", 3)
-        img_size = config.get("img_size", 64)
+        img_size = config.get("img_size", 48)
         num_classes = config.get("num_classes", 138)
+    elif dataset.lower() == "turcoins10":
+        model_name = config.get("model", "DriftDiT-Small")
+        in_channels = config.get("in_channels", 3)
+        img_size = config.get("img_size", 48)
+        num_classes = config.get("num_classes", 10)
     else:
         model_name = config.get("model", "DriftDiT-Small")
         in_channels = config.get("in_channels", 3)
@@ -401,7 +406,7 @@ def main():
         "--dataset",
         type=str,
         default="mnist",
-        choices=["mnist", "cifar10", "turcoins"],
+        choices=["mnist", "cifar10", "turcoins", "turcoins10"],
         help="Dataset (for determining model config)",
     )
     parser.add_argument(

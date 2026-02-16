@@ -82,7 +82,7 @@ CIFAR10_CONFIG = {
 
 TURCOINS_CONFIG = {
     "model": "DriftDiT-Small",
-    "img_size": 32,
+    "img_size": 48,
     "in_channels": 3,
     "num_classes": 138,
     "batch_nc": 10,
@@ -94,7 +94,7 @@ TURCOINS_CONFIG = {
     "grad_clip": 2.0,
     "ema_decay": 0.999,
     "warmup_steps": 2000,
-    "epochs": 200,
+    "epochs": 400,
     "alpha_min": 1.0,
     "alpha_max": 3.0,
     "use_feature_encoder": True,
@@ -102,21 +102,69 @@ TURCOINS_CONFIG = {
     "label_dropout": 0.1,
 }
 
+# 10-class subset of TurCoins
+# Original label indices in the HuggingFace dataset
+TURCOINS10_CLASSES = [54, 55, 56, 57, 60, 61, 62, 64, 88, 70]
+# Class names:  8330, 8331, 8600, 8601, 8620, 8621, 8630, 8640, 8860, 8670
+
+TURCOINS10_CONFIG = {
+    "model": "DriftDiT-Small",
+    "img_size": 48,
+    "in_channels": 3,
+    "num_classes": 10,
+    "batch_nc": 10,
+    "batch_n_pos": 32,
+    "batch_n_neg": 32,
+    "temperatures": [0.02, 0.05, 0.2],
+    "lr": 2e-4,
+    "weight_decay": 0.01,
+    "grad_clip": 2.0,
+    "ema_decay": 0.999,
+    "warmup_steps": 2000,
+    "epochs": 400,
+    "alpha_min": 1.0,
+    "alpha_max": 3.0,
+    "use_feature_encoder": True,
+    "queue_size": 64,
+    "label_dropout": 0.1,
+    "class_subset": TURCOINS10_CLASSES,
+    "dataloader_batch_size": 32,
+}
+
 
 class HFImageDataset(torch.utils.data.Dataset):
-    """Adapter to wrap a HuggingFace imagefolder dataset as a PyTorch dataset."""
+    """Adapter to wrap a HuggingFace imagefolder dataset as a PyTorch dataset.
 
-    def __init__(self, hf_dataset, transform=None):
-        self.hf_dataset = hf_dataset
+    Args:
+        hf_dataset: HuggingFace dataset split
+        transform: torchvision transforms to apply
+        class_subset: If provided, only keep samples whose original label is in this list.
+                      Labels are remapped to 0..len(class_subset)-1.
+    """
+
+    def __init__(self, hf_dataset, transform=None, class_subset=None):
         self.transform = transform
+        if class_subset is not None:
+            self.label_map = {orig: new for new, orig in enumerate(class_subset)}
+            self.indices = [i for i, item in enumerate(hf_dataset) if item["label"] in self.label_map]
+            self.hf_dataset = hf_dataset
+        else:
+            self.label_map = None
+            self.indices = None
+            self.hf_dataset = hf_dataset
 
     def __len__(self):
+        if self.indices is not None:
+            return len(self.indices)
         return len(self.hf_dataset)
 
     def __getitem__(self, idx):
-        item = self.hf_dataset[idx]
+        real_idx = self.indices[idx] if self.indices is not None else idx
+        item = self.hf_dataset[real_idx]
         image = item["image"].convert("RGB")
         label = item["label"]
+        if self.label_map is not None:
+            label = self.label_map[label]
         if self.transform:
             image = self.transform(image)
         return image, label
@@ -146,23 +194,26 @@ def get_dataset(name: str, root: str = "./data") -> tuple:
         ])
         train_dataset = datasets.CIFAR10(root, train=True, download=True, transform=transform)
         test_dataset = datasets.CIFAR10(root, train=False, download=True, transform=test_transform)
-    elif name.lower() == "turcoins":
+    elif name.lower() in ["turcoins", "turcoins10"]:
+        cfg = TURCOINS_CONFIG if name.lower() == "turcoins" else TURCOINS10_CONFIG
+        img_sz = cfg["img_size"]
         transform = transforms.Compose([
-            transforms.Resize(32),
-            transforms.CenterCrop(32),
+            transforms.Resize(img_sz),
+            transforms.CenterCrop(img_sz),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
         ])
         test_transform = transforms.Compose([
-            transforms.Resize(32),
-            transforms.CenterCrop(32),
+            transforms.Resize(img_sz),
+            transforms.CenterCrop(img_sz),
             transforms.ToTensor(),
             transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
         ])
         hf_ds = hf_load_dataset("hsyntemiz/turcoins")
-        train_dataset = HFImageDataset(hf_ds["train"], transform=transform)
-        test_dataset = HFImageDataset(hf_ds["test"], transform=test_transform)
+        class_subset = TURCOINS10_CLASSES if name.lower() == "turcoins10" else None
+        train_dataset = HFImageDataset(hf_ds["train"], transform=transform, class_subset=class_subset)
+        test_dataset = HFImageDataset(hf_ds["test"], transform=test_transform, class_subset=class_subset)
     else:
         raise ValueError(f"Unknown dataset: {name}")
 
@@ -410,7 +461,7 @@ def train(
     set_seed(seed)
 
     # Get config
-    configs = {"mnist": MNIST_CONFIG, "cifar10": CIFAR10_CONFIG, "turcoins": TURCOINS_CONFIG}
+    configs = {"mnist": MNIST_CONFIG, "cifar10": CIFAR10_CONFIG, "turcoins": TURCOINS_CONFIG, "turcoins10": TURCOINS10_CONFIG}
     config = configs[dataset.lower()].copy()
     config["dataset"] = dataset
     if epochs_override is not None:
@@ -426,9 +477,10 @@ def train(
 
     # Load dataset
     train_dataset, test_dataset = get_dataset(dataset)
+    dl_batch_size = config.get("dataloader_batch_size", 256)
     train_loader = DataLoader(
         train_dataset,
-        batch_size=256,
+        batch_size=dl_batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
